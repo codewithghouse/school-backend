@@ -45,6 +45,7 @@ app.use(express.json());
 
 // --- 1️⃣ Route: Invite Teacher (Atomic) ---
 app.post('/invite-teacher', async (req, res) => {
+    console.log('🔥 BACKEND INVITE ROUTE HIT');
     const { email, name, schoolId, subjects, classIds, schoolName } = req.body;
     console.log('--- Teacher Invite Request ---');
     console.log(`Email: ${email}, School: ${schoolName}`);
