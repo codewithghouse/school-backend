@@ -1,34 +1,79 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const admin = require('firebase-admin');
 
+// --- Firebase Admin Initialization ---
+// For Render deployment, you must add FIREBASE_SERVICE_ACCOUNT (JSON string) to your Env Vars
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    try {
+        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        console.log('✅ Firebase Admin Initialized');
+    } catch (e) {
+        console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT:', e.message);
+    }
+} else {
+    // Fallback for local dev if you have the ADC or already logged in via CLI
+    admin.initializeApp();
+}
+
+const db = admin.firestore();
 const app = express();
 const PORT = process.env.PORT || 3002;
 
-// --- STEP 1: Verify Env Loading ---
-console.log('--- Backend Configuration ---');
-console.log('PORT:', PORT);
-console.log('RESEND_API_KEY:', process.env.RESEND_API_KEY ? 'Present (Hidden)' : 'MISSING');
-console.log('RESEND_FROM_EMAIL:', process.env.RESEND_FROM_EMAIL || 'MISSING');
-console.log('APP_BASE_URL:', process.env.APP_BASE_URL || 'MISSING');
-console.log('-----------------------------');
+// --- CORS POLICY ---
+// Strictly allow only your Vercel frontend
+const allowedOrigins = [
+    'https://schooldashboard-1bqa-f94356e3.vercel.app', // Update this to your PRODUCTION domain
+    'http://localhost:5173'
+];
 
-// Middleware
-app.use(cors());
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    }
+}));
+
 app.use(express.json());
 
-// --- STEP 4: Hard-coded Test Route ---
-app.get('/test-mail', async (req, res) => {
-    console.log('GET /test-mail hit');
-    const resendApiKey = process.env.RESEND_API_KEY;
-    const fromEmail = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+// --- 1️⃣ Route: Invite Teacher (Atomic) ---
+app.post('/invite-teacher', async (req, res) => {
+    const { email, name, schoolId, subjects, classIds, schoolName } = req.body;
+    console.log('--- Teacher Invite Request ---');
+    console.log(`Email: ${email}, School: ${schoolName}`);
 
-    if (!resendApiKey) {
-        return res.status(500).json({ error: 'RESEND_API_KEY is missing' });
+    if (!email || !schoolId || !schoolName) {
+        return res.status(400).json({ error: 'Missing required fields' });
     }
 
     try {
-        console.log('Attempting to send test email via direct fetch...');
+        const resendApiKey = process.env.RESEND_API_KEY;
+        const fromEmail = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+        const appBaseUrl = process.env.APP_BASE_URL || 'http://localhost:5173';
+
+        // 1. Create Firestore Document
+        // We do this on the backend to ensure it's recorded BEFORE the email is sent
+        const inviteRef = await db.collection('invites').add({
+            email: email.toLowerCase().trim(),
+            name: name || 'Teacher',
+            role: 'teacher',
+            schoolId,
+            subjects: subjects || [],
+            classIds: classIds || [],
+            status: 'pending',
+            createdAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        console.log(`✅ Invite doc created: ${inviteRef.id}`);
+
+        // 2. Call Resend API
         const response = await fetch('https://api.resend.com/emails', {
             method: 'POST',
             headers: {
@@ -37,67 +82,49 @@ app.get('/test-mail', async (req, res) => {
             },
             body: JSON.stringify({
                 from: fromEmail,
-                to: fromEmail, // Send to yourself for testing (onboarding@resend.dev usually goes to the registered email)
-                subject: 'Local Test Email',
-                text: 'This is a test email from your local Node.js backend.'
+                to: email,
+                subject: `You’ve been invited as a Teacher at ${schoolName}`,
+                html: `
+                    <div style="font-family: sans-serif; color: #333; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #eee; border-radius: 10px;">
+                        <h2 style="color: #4F46E5;">Welcome to the Team!</h2>
+                        <p>You have been added as a Teacher at <strong>${schoolName}</strong>.</p>
+                        <p>Please login using this email to activate your account and access your dashboard:</p>
+                        <div style="text-align: center; margin: 30px 0;">
+                            <a href="${appBaseUrl}/login" style="display: inline-block; padding: 14px 28px; background-color: #4F46E5; color: white; text-decoration: none; border-radius: 8px; font-weight: bold; font-size: 16px;">Activate & Login</a>
+                        </div>
+                        <p style="font-size: 12px; color: #666; border-top: 1px solid #eee; padding-top: 20px;">If you didn't expect this invitation, please ignore this email.</p>
+                    </div>
+                `
             })
         });
 
         const data = await response.json();
-        console.log('Resend Response Status:', response.status);
-        console.log('Resend Response Data:', data);
+        if (!response.ok) throw new Error(JSON.stringify(data));
 
-        if (!response.ok) {
-            return res.status(response.status).json({ error: data });
-        }
+        console.log('✅ Email sent via Resend');
+        res.status(200).json({ success: true, inviteId: inviteRef.id });
 
-        res.status(200).json({ success: true, message: 'Test email sent! Check Resend Dashboard.', data });
     } catch (err) {
-        console.error('Test Mail Error:', err);
+        console.error('❌ Teacher Invite Failed:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
 
-// Main endpoint
+// --- 2️⃣ Generic Invite (Parent/Other) ---
 app.post('/send-invite', async (req, res) => {
-    const { email, type, schoolName } = req.body;
-    console.log('--- POST /send-invite ---');
-    console.log('Request Body:', { email, type, schoolName });
-
-    if (!email || !type || !schoolName) {
-        console.error('Validation Failed: Missing fields');
-        return res.status(400).json({ error: 'Missing required fields (email, type, schoolName)' });
-    }
-
-    const appBaseUrl = process.env.APP_BASE_URL || 'http://localhost:5173';
-    const fromEmail = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
-    const resendApiKey = process.env.RESEND_API_KEY;
-
-    if (!resendApiKey) {
-        console.error('Configuration Error: RESEND_API_KEY is missing');
-        return res.status(500).json({ error: 'Resend API Key is not configured' });
-    }
-
-    let subject = '';
-    let body = '';
-
-    if (type === 'teacher') {
-        subject = `You’ve been added as a Teacher at ${schoolName}`;
-        body = `You have been added as a Teacher at ${schoolName}.\nLogin here: ${appBaseUrl}/login`;
-    } else if (type === 'parent') {
-        subject = `Your child has been added to ${schoolName}`;
-        body = `Your child has been added to ${schoolName}.\nLogin here: ${appBaseUrl}/login`;
-    } else {
-        console.error('Validation Failed: Invalid type', type);
-        return res.status(400).json({ error: 'Invalid invitation type' });
-    }
+    const { email, type, schoolName, studentName } = req.body;
 
     try {
-        console.log('Sending email via Resend API...');
+        const fromEmail = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+        const appBaseUrl = process.env.APP_BASE_URL || 'http://localhost:5173';
+
+        let subject = type === 'parent' ? `Child added to ${schoolName}` : `Invitation from ${schoolName}`;
+        let body = `Hello, your child ${studentName || ''} has been added. Login at: ${appBaseUrl}/login`;
+
         const response = await fetch('https://api.resend.com/emails', {
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${resendApiKey}`,
+                'Authorization': `Bearer ${process.env.RESEND_API_KEY}`,
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
@@ -109,25 +136,15 @@ app.post('/send-invite', async (req, res) => {
         });
 
         const data = await response.json();
-        console.log('Resend API Result:', { status: response.status, data });
-
-        if (!response.ok) {
-            console.error('Resend API Error Detail:', data);
-            return res.status(response.status).json({ error: data });
-        }
-
-        res.status(200).json({ success: true, data });
+        res.status(response.status).json(data);
     } catch (err) {
-        console.error('Unexpected Backend Server Error:', err);
-        res.status(500).json({ error: 'Internal server error' });
+        res.status(500).json({ error: err.message });
     }
 });
 
 // Health check
-app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'server is running' });
-});
+app.get('/health', (req, res) => res.status(200).json({ status: 'server is running' }));
 
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`🚀 Backend running on port ${PORT}`);
 });
